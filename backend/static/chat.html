@@ -1,0 +1,239 @@
+'''
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>Chat Application</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+    <div class="container">
+        <div class="header">
+            <h2>Welcome, {{ user_data.name }}!</h2>
+            <p>Age: {{ user_data.age }}, Location: {{ user_data.state }}, {{ user_data.country }}</p>
+            <button id="logout">Logout</button>
+        </div>
+
+        <div class="chat-layout">
+            <div class="sidebar">
+                <h3>Online Users</h3>
+                <ul id="online-users"></ul>
+                <h3>Rooms</h3>
+                <ul id="chat-rooms">
+                    <li data-room-id="general" class="active">General Chat</li>
+                </ul>
+            </div>
+
+            <div class="main-chat">
+                <h3 id="current-chat-title">General Chat</h3>
+                <div id="messages" class="message-area"></div>
+                <div class="message-input">
+                    <input id="message-input" type="text" placeholder="Type your message..." />
+                    <button id="send-button">Send</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            const userId = "{{ user_id }}";
+            const userData = {{ user_data | tojson }};
+            const ws = new WebSocket(`ws://${location.host}/ws/${userId}`);
+            let currentRoom = 'general';
+            let currentPrivateChatUser = null;
+
+            const onlineUsersList = document.getElementById('online-users');
+            const chatRoomsList = document.getElementById('chat-rooms');
+            const messagesDiv = document.getElementById('messages');
+            const messageInput = document.getElementById('message-input');
+            const sendButton = document.getElementById('send-button');
+            const currentChatTitle = document.getElementById('current-chat-title');
+            const logoutButton = document.getElementById('logout');
+
+            ws.onopen = (event) => {
+                console.log("WebSocket connection opened:", event);
+            };
+
+            ws.onerror = (event) => {
+                console.error("WebSocket error observed:", event);
+            };
+
+            ws.onclose = (event) => {
+                console.log("WebSocket connection closed:", event);
+            };
+
+            ws.onmessage = (event) => {
+                const payload = JSON.parse(event.data);
+                console.log('Received:', payload);
+
+                if (payload.type === 'online_users_list') {
+                    updateOnlineUsers(payload.users);
+                } else if (payload.type === 'user_status') {
+                    fetch('/online_users')
+                        .then(response => response.json())
+                        .then(users => updateOnlineUsers(users));
+                    if (payload.status === 'join' && currentRoom === 'general') {
+                        appendMessage({ type: 'join', sender: payload.user_id, content: `${payload.user_id} joined`, ts: payload.ts });
+                    } else if (payload.status === 'leave' && currentRoom === 'general') {
+                        appendMessage({ type: 'leave', sender: payload.user_id, content: `${payload.user_id} left`, ts: payload.ts });
+                    }
+                } else if (payload.type === 'message') {
+                    if (payload.is_private) {
+                        if (currentPrivateChatUser) {
+                            const expectedRoomId = [userId, currentPrivateChatUser].sort().join('-');
+                            if (payload.room === expectedRoomId) {
+                                appendMessage(payload);
+                            }
+                        }
+                    } else { 
+                        if (payload.room === currentRoom) {
+                            appendMessage(payload);
+                        }
+                    }
+                }
+            };
+
+            function appendMessage(msg) {
+                const d = document.createElement('div');
+                d.classList.add('message-item');
+                let senderText = msg.sender === userId ? 'You' : msg.sender;
+                let contentText = msg.content;
+
+                if (msg.type === 'join' || msg.type === 'leave') {
+                    d.classList.add('system-message');
+                    d.innerText = `[${new Date(msg.ts * 1000).toLocaleTimeString()}] ${msg.content}`;
+                } else if (msg.type === 'message') {
+                    if (msg.is_private) {
+                        d.classList.add('private-message');
+                        if (msg.sender === userId) {
+                            d.innerText = `[${new Date(msg.ts * 1000).toLocaleTimeString()}] You (to ${msg.to}): ${msg.content}`;
+                        } else {
+                            d.innerText = `[${new Date(msg.ts * 1000).toLocaleTimeString()}] ${msg.sender} (private): ${msg.content}`;
+                        }
+                    } else {
+                        d.innerText = `[${new Date(msg.ts * 1000).toLocaleTimeString()}] ${senderText}: ${contentText}`;
+                    }
+                }
+                messagesDiv.appendChild(d);
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            }
+
+            async function loadMessageHistory(roomOrUser) {
+                messagesDiv.innerHTML = '';
+                const response = await fetch(`/messages/${roomOrUser}`);
+                const history = await response.json();
+                history.reverse().forEach(msg => {
+                    const d = document.createElement('div');
+                    d.classList.add('message-item');
+                    let senderText = msg.sender === userId ? 'You' : msg.sender;
+                    let contentText = msg.content;
+                    if (msg.is_private) {
+                        d.classList.add('private-message');
+                        const metadata = typeof msg.metadata === 'string' ? JSON.parse(msg.metadata) : msg.metadata;
+                        if (msg.sender === userId) {
+                            d.innerText = `[${new Date(msg.created_at).toLocaleTimeString()}] You (to ${metadata.to}): ${msg.content}`;
+                        } else {
+                            d.innerText = `[${new Date(msg.created_at).toLocaleTimeString()}] ${msg.sender} (private): ${msg.content}`;
+                        }
+                    } else {
+                        d.innerText = `[${new Date(msg.created_at).toLocaleTimeString()}] ${senderText}: ${contentText}`;
+                    }
+                    messagesDiv.appendChild(d);
+                });
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            }
+
+            function updateOnlineUsers(users) {
+                onlineUsersList.innerHTML = '';
+                users.forEach(user => {
+                    if (user.name !== userId) {
+                        const li = document.createElement('li');
+                        li.innerText = `${user.name} (${user.age}, ${user.state}, ${user.country})`;
+                        li.dataset.userId = user.name;
+                        li.addEventListener('click', () => startPrivateChat(user.name));
+                        onlineUsersList.appendChild(li);
+                    }
+                });
+            }
+
+            function startPrivateChat(targetUser) {
+                currentRoom = null;
+                currentPrivateChatUser = targetUser;
+                currentChatTitle.innerText = `Private Chat with ${targetUser}`;
+                Array.from(onlineUsersList.children).forEach(li => {
+                    if (li.dataset.userId === targetUser) {
+                        li.classList.add('active');
+                    } else {
+                        li.classList.remove('active');
+                    }
+                });
+                Array.from(chatRoomsList.children).forEach(li => li.classList.remove('active'));
+                const roomId = [userId, targetUser].sort().join('-');
+                loadMessageHistory(roomId);
+            }
+
+            function joinRoom(roomId) {
+                currentRoom = roomId;
+                currentPrivateChatUser = null;
+                currentChatTitle.innerText = `${roomId.charAt(0).toUpperCase() + roomId.slice(1)} Chat`;
+                Array.from(chatRoomsList.children).forEach(li => {
+                    if (li.dataset.roomId === roomId) {
+                        li.classList.add('active');
+                    } else {
+                        li.classList.remove('active');
+                    }
+                });
+                Array.from(onlineUsersList.children).forEach(li => li.classList.remove('active'));
+                loadMessageHistory(roomId);
+            }
+
+            fetch('/online_users')
+                .then(response => response.json())
+                .then(users => updateOnlineUsers(users));
+            loadMessageHistory('general');
+
+            sendButton.onclick = () => {
+                const messageContent = messageInput.value;
+                if (messageContent.trim() === '') return;
+
+                const chatMessage = {
+                    type: 'chat_message',
+                    content: messageContent,
+                };
+
+                if (currentPrivateChatUser) {
+                    chatMessage.to = currentPrivateChatUser;
+                    chatMessage.room = [userId, currentPrivateChatUser].sort().join('-');
+                } else {
+                    chatMessage.room = currentRoom;
+                }
+                ws.send(JSON.stringify(chatMessage));
+                messageInput.value = '';
+            };
+
+            messageInput.addEventListener('keypress', (event) => {
+                if (event.key === 'Enter') {
+                    sendButton.click();
+                }
+            });
+
+            chatRoomsList.addEventListener('click', (event) => {
+                const target = event.target;
+                if (target.tagName === 'LI' && target.dataset.roomId) {
+                    joinRoom(target.dataset.roomId);
+                }
+            });
+
+            logoutButton.onclick = () => {
+                document.cookie = "user_id=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
+                window.location.href = '/';
+            };
+        });
+    </script>
+</body>
+
+</html>
+'''

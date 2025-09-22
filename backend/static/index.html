@@ -1,0 +1,40 @@
+
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>Register for Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+    <div class="container">
+        <h2>Register for Chat</h2>
+        <form action="/register" method="post">
+            <div class="form-group">
+                <label for="name">Name:</label>
+                <input type="text" id="name" name="name" required>
+            </div>
+            <div class="form-group">
+                <label for="age">Age:</label>
+                <input type="number" id="age" name="age" required min="18">
+            </div>
+            <div class="form-group">
+                <label for="country">Country:</label>
+                <input type="text" id="country" name="country" required>
+            </div>
+            <div class="form-group">
+                <label for="state">State:</label>
+                <input type="text" id="state" name="state" required>
+            </div>
+            <button type="submit">Join Chat</button>
+        </form>
+        {% if request.query_params.error == 'age_restriction' %}
+            <p style="color: red;">You must be 18 or older to join the chat.</p>
+        {% endif %}
+    </div>
+</body>
+
+</html>
+
