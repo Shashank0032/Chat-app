@@ -3,9 +3,5 @@ uvicorn[standard]==0.22.0
 redis==4.6.0
 asyncpg==0.29.0
 aiofiles==23.1.0
-
 Jinja2==3.1.2
-
-
 python-multipart==0.0.6
-

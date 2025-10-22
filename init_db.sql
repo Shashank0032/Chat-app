@@ -1,4 +1,3 @@
--- backend/init_db.sql
 CREATE TABLE IF NOT EXISTS messages (
     id SERIAL PRIMARY KEY,
     room TEXT NOT NULL,

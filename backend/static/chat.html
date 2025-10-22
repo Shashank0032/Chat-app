@@ -1,4 +1,3 @@
-'''
 <!doctype html>
 <html>
 
@@ -20,6 +19,7 @@
             <div class="sidebar">
                 <h3>Online Users</h3>
                 <ul id="online-users"></ul>
+
                 <h3>Rooms</h3>
                 <ul id="chat-rooms">
                     <li data-room-id="general" class="active">General Chat</li>
@@ -38,13 +38,20 @@
     </div>
 
     <script>
-        document.addEventListener("DOMContentLoaded", function() {
+        document.addEventListener("DOMContentLoaded", function () {
             const userId = "{{ user_id }}";
-            const userData = {{ user_data | tojson }};
-            const ws = new WebSocket(`ws://${location.host}/ws/${userId}`);
-            let currentRoom = 'general';
-            let currentPrivateChatUser = null;
+            const userData = JSON.parse('{{ user_data | tojson | safe }}');
 
+            const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/${encodeURIComponent(userId)}`);
+
+            // ----------------- State -----------------
+            const GENERAL = 'general';
+            const conversations = {}; // roomId -> { messages:[], unread:0, loaded:false }
+
+            let currentRoom = GENERAL;          // either 'general' or dm roomId
+            let currentPrivateChatUser = null;  // for convenience
+
+            // ----------------- DOM refs -----------------
             const onlineUsersList = document.getElementById('online-users');
             const chatRoomsList = document.getElementById('chat-rooms');
             const messagesDiv = document.getElementById('messages');
@@ -53,180 +60,219 @@
             const currentChatTitle = document.getElementById('current-chat-title');
             const logoutButton = document.getElementById('logout');
 
-            ws.onopen = (event) => {
-                console.log("WebSocket connection opened:", event);
-            };
+            // ----------------- Helpers -----------------
+            const dmRoom = (a, b) => [a, b].sort().join('-');
+            const cacheKey = (roomId) => `chat_cache:${userId}:${roomId}`;
 
-            ws.onerror = (event) => {
-                console.error("WebSocket error observed:", event);
-            };
+            function ensureConv(roomId) {
+                if (!conversations[roomId]) {
+                    conversations[roomId] = { messages: [], unread: 0, loaded: false };
+                    // warm from localStorage if present
+                    const raw = localStorage.getItem(cacheKey(roomId));
+                    if (raw) {
+                        try {
+                            conversations[roomId].messages = JSON.parse(raw);
+                            conversations[roomId].loaded = true;
+                        } catch (_) { }
+                    }
+                }
+                return conversations[roomId];
+            }
 
-            ws.onclose = (event) => {
-                console.log("WebSocket connection closed:", event);
-            };
+            function saveCache(roomId) {
+                const conv = ensureConv(roomId);
+                const trimmed = conv.messages.slice(-200);
+                localStorage.setItem(cacheKey(roomId), JSON.stringify(trimmed));
+            }
 
+            function renderConversation(roomId) {
+                const conv = ensureConv(roomId);
+                messagesDiv.innerHTML = '';
+                conv.messages.forEach(appendMessageDOM);
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            }
+
+            function appendMessageDOM(msg) {
+                const d = document.createElement('div');
+                d.classList.add('message-item');
+                if (msg.is_private) d.classList.add('private-message');
+
+                const ts = msg.ts ? new Date(msg.ts * 1000) :
+                    msg.created_at ? new Date(msg.created_at) :
+                        new Date();
+
+                if (msg.is_private && msg.sender === userId) {
+                    d.innerText = `[${ts.toLocaleTimeString()}] You (to ${msg.to}): ${msg.content}`;
+                } else if (msg.is_private) {
+                    d.innerText = `[${ts.toLocaleTimeString()}] ${msg.sender} (private): ${msg.content}`;
+                } else {
+                    const who = msg.sender === userId ? 'You' : msg.sender;
+                    d.innerText = `[${ts.toLocaleTimeString()}] ${who}: ${msg.content}`;
+                }
+                messagesDiv.appendChild(d);
+            }
+
+            function getOrCreateBadge(li) {
+                let b = li.querySelector('.badge');
+                if (!b) {
+                    b = document.createElement('span');
+                    b.className = 'badge';
+                    li.appendChild(b);
+                }
+                return b;
+            }
+
+            function bumpUnread(roomId, li) {
+                if (roomId === currentRoom) return; // visible, no unread
+                const conv = ensureConv(roomId);
+                conv.unread++;
+                if (li) {
+                    const badge = getOrCreateBadge(li);
+                    badge.textContent = String(conv.unread);
+                    li.classList.add('unread');
+                }
+            }
+
+            function clearUnread(roomId, li) {
+                const conv = ensureConv(roomId);
+                conv.unread = 0;
+                if (li) {
+                    li.classList.remove('unread');
+                    const badge = li.querySelector('.badge');
+                    if (badge) badge.remove();
+                }
+            }
+
+            async function fetchHistory(roomId) {
+                const conv = ensureConv(roomId);
+                if (conv.loaded) return; // fetch once then use cache
+                try {
+                    const r = await fetch(`/messages/${encodeURIComponent(roomId)}?limit=200`);
+                    const hist = await r.json();
+                    hist.reverse().forEach(m => conv.messages.push(m));
+                    conv.loaded = true;
+                    saveCache(roomId);
+                } catch (_) { }
+            }
+
+            // ----------------- WebSocket -----------------
             ws.onmessage = (event) => {
                 const payload = JSON.parse(event.data);
-                console.log('Received:', payload);
 
                 if (payload.type === 'online_users_list') {
                     updateOnlineUsers(payload.users);
-                } else if (payload.type === 'user_status') {
-                    fetch('/online_users')
-                        .then(response => response.json())
-                        .then(users => updateOnlineUsers(users));
-                    if (payload.status === 'join' && currentRoom === 'general') {
-                        appendMessage({ type: 'join', sender: payload.user_id, content: `${payload.user_id} joined`, ts: payload.ts });
-                    } else if (payload.status === 'leave' && currentRoom === 'general') {
-                        appendMessage({ type: 'leave', sender: payload.user_id, content: `${payload.user_id} left`, ts: payload.ts });
+                    return;
+                }
+
+                if (payload.type === 'message') {
+                    let roomId = payload.room;
+                    if (payload.is_private && payload.to) {
+                        roomId = dmRoom(payload.sender, payload.to);
                     }
-                } else if (payload.type === 'message') {
-                    if (payload.is_private) {
-                        if (currentPrivateChatUser) {
-                            const expectedRoomId = [userId, currentPrivateChatUser].sort().join('-');
-                            if (payload.room === expectedRoomId) {
-                                appendMessage(payload);
-                            }
-                        }
-                    } else { 
-                        if (payload.room === currentRoom) {
-                            appendMessage(payload);
+
+                    const conv = ensureConv(roomId);
+                    conv.messages.push(payload);
+                    saveCache(roomId);
+
+                    if (roomId === currentRoom) {
+                        appendMessageDOM(payload);
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                    } else {
+                        // find the correct LI to badge
+                        if (payload.is_private) {
+                            const other = payload.sender === userId ? payload.to : payload.sender;
+                            const li = onlineUsersList.querySelector(`li[data-user-id="${CSS.escape(other)}"]`);
+                            bumpUnread(roomId, li);
+                        } else {
+                            const li = chatRoomsList.querySelector(`li[data-room-id="${CSS.escape(roomId)}"]`);
+                            bumpUnread(roomId, li);
                         }
                     }
                 }
             };
 
-            function appendMessage(msg) {
-                const d = document.createElement('div');
-                d.classList.add('message-item');
-                let senderText = msg.sender === userId ? 'You' : msg.sender;
-                let contentText = msg.content;
-
-                if (msg.type === 'join' || msg.type === 'leave') {
-                    d.classList.add('system-message');
-                    d.innerText = `[${new Date(msg.ts * 1000).toLocaleTimeString()}] ${msg.content}`;
-                } else if (msg.type === 'message') {
-                    if (msg.is_private) {
-                        d.classList.add('private-message');
-                        if (msg.sender === userId) {
-                            d.innerText = `[${new Date(msg.ts * 1000).toLocaleTimeString()}] You (to ${msg.to}): ${msg.content}`;
-                        } else {
-                            d.innerText = `[${new Date(msg.ts * 1000).toLocaleTimeString()}] ${msg.sender} (private): ${msg.content}`;
-                        }
-                    } else {
-                        d.innerText = `[${new Date(msg.ts * 1000).toLocaleTimeString()}] ${senderText}: ${contentText}`;
-                    }
-                }
-                messagesDiv.appendChild(d);
-                messagesDiv.scrollTop = messagesDiv.scrollHeight;
-            }
-
-            async function loadMessageHistory(roomOrUser) {
-                messagesDiv.innerHTML = '';
-                const response = await fetch(`/messages/${roomOrUser}`);
-                const history = await response.json();
-                history.reverse().forEach(msg => {
-                    const d = document.createElement('div');
-                    d.classList.add('message-item');
-                    let senderText = msg.sender === userId ? 'You' : msg.sender;
-                    let contentText = msg.content;
-                    if (msg.is_private) {
-                        d.classList.add('private-message');
-                        const metadata = typeof msg.metadata === 'string' ? JSON.parse(msg.metadata) : msg.metadata;
-                        if (msg.sender === userId) {
-                            d.innerText = `[${new Date(msg.created_at).toLocaleTimeString()}] You (to ${metadata.to}): ${msg.content}`;
-                        } else {
-                            d.innerText = `[${new Date(msg.created_at).toLocaleTimeString()}] ${msg.sender} (private): ${msg.content}`;
-                        }
-                    } else {
-                        d.innerText = `[${new Date(msg.created_at).toLocaleTimeString()}] ${senderText}: ${contentText}`;
-                    }
-                    messagesDiv.appendChild(d);
-                });
-                messagesDiv.scrollTop = messagesDiv.scrollHeight;
-            }
-
+            // ----------------- UI: online users & navigation -----------------
             function updateOnlineUsers(users) {
                 onlineUsersList.innerHTML = '';
-                users.forEach(user => {
-                    if (user.name !== userId) {
-                        const li = document.createElement('li');
-                        li.innerText = `${user.name} (${user.age}, ${user.state}, ${user.country})`;
-                        li.dataset.userId = user.name;
-                        li.addEventListener('click', () => startPrivateChat(user.name));
-                        onlineUsersList.appendChild(li);
+                users.forEach(u => {
+                    if (u.name === userId) return;
+                    const li = document.createElement('li');
+                    li.dataset.userId = u.name;
+                    li.innerHTML = `<span>${u.name} (${u.age}, ${u.state}, ${u.country})</span>`;
+                    // restore badge if we had unread
+                    const rid = dmRoom(userId, u.name);
+                    const conv = ensureConv(rid);
+                    if (conv.unread > 0) {
+                        const badge = getOrCreateBadge(li);
+                        badge.textContent = String(conv.unread);
+                        li.classList.add('unread');
                     }
+                    li.addEventListener('click', () => startPrivateChat(u.name, li));
+                    onlineUsersList.appendChild(li);
                 });
             }
 
-            function startPrivateChat(targetUser) {
-                currentRoom = null;
-                currentPrivateChatUser = targetUser;
-                currentChatTitle.innerText = `Private Chat with ${targetUser}`;
-                Array.from(onlineUsersList.children).forEach(li => {
-                    if (li.dataset.userId === targetUser) {
-                        li.classList.add('active');
-                    } else {
-                        li.classList.remove('active');
-                    }
-                });
+            function startPrivateChat(target, liEl) {
+                currentPrivateChatUser = target;
+                currentRoom = dmRoom(userId, target);
+                currentChatTitle.innerText = `Private Chat with ${target}`;
+
                 Array.from(chatRoomsList.children).forEach(li => li.classList.remove('active'));
-                const roomId = [userId, targetUser].sort().join('-');
-                loadMessageHistory(roomId);
+                Array.from(onlineUsersList.children).forEach(li => li.classList.toggle('active', li.dataset.userId === target));
+
+                clearUnread(currentRoom, liEl || onlineUsersList.querySelector(`li[data-user-id="${CSS.escape(target)}"]`));
+
+                (async () => {
+                    await fetchHistory(currentRoom);
+                    renderConversation(currentRoom);
+                })();
             }
 
             function joinRoom(roomId) {
                 currentRoom = roomId;
                 currentPrivateChatUser = null;
                 currentChatTitle.innerText = `${roomId.charAt(0).toUpperCase() + roomId.slice(1)} Chat`;
-                Array.from(chatRoomsList.children).forEach(li => {
-                    if (li.dataset.roomId === roomId) {
-                        li.classList.add('active');
-                    } else {
-                        li.classList.remove('active');
-                    }
-                });
+
+                Array.from(chatRoomsList.children).forEach(li => li.classList.toggle('active', li.dataset.roomId === roomId));
                 Array.from(onlineUsersList.children).forEach(li => li.classList.remove('active'));
-                loadMessageHistory(roomId);
+
+                clearUnread(roomId, chatRoomsList.querySelector(`li[data-room-id="${CSS.escape(roomId)}"]`));
+
+                (async () => {
+                    await fetchHistory(roomId);
+                    renderConversation(roomId);
+                })();
             }
 
-            fetch('/online_users')
-                .then(response => response.json())
-                .then(users => updateOnlineUsers(users));
-            loadMessageHistory('general');
+            // initial loads
+            ensureConv(GENERAL);
+            fetch('/online_users').then(r => r.json()).then(updateOnlineUsers);
+            (async () => { await fetchHistory(GENERAL); renderConversation(GENERAL); })();
 
+            // room click
+            chatRoomsList.addEventListener('click', (e) => {
+                const li = e.target.closest('li[data-room-id]');
+                if (li) joinRoom(li.dataset.roomId);
+            });
+
+            // send
             sendButton.onclick = () => {
-                const messageContent = messageInput.value;
-                if (messageContent.trim() === '') return;
+                const content = messageInput.value.trim();
+                if (!content) return;
 
-                const chatMessage = {
-                    type: 'chat_message',
-                    content: messageContent,
-                };
-
+                const msg = { type: 'chat_message', content };
                 if (currentPrivateChatUser) {
-                    chatMessage.to = currentPrivateChatUser;
-                    chatMessage.room = [userId, currentPrivateChatUser].sort().join('-');
+                    msg.to = currentPrivateChatUser;
+                    msg.room = dmRoom(userId, currentPrivateChatUser);
                 } else {
-                    chatMessage.room = currentRoom;
+                    msg.room = currentRoom;
                 }
-                ws.send(JSON.stringify(chatMessage));
+                ws.send(JSON.stringify(msg));
                 messageInput.value = '';
             };
+            messageInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendButton.click(); });
 
-            messageInput.addEventListener('keypress', (event) => {
-                if (event.key === 'Enter') {
-                    sendButton.click();
-                }
-            });
-
-            chatRoomsList.addEventListener('click', (event) => {
-                const target = event.target;
-                if (target.tagName === 'LI' && target.dataset.roomId) {
-                    joinRoom(target.dataset.roomId);
-                }
-            });
-
+            // logout
             logoutButton.onclick = () => {
                 document.cookie = "user_id=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
                 window.location.href = '/';
@@ -236,4 +282,3 @@
 </body>
 
 </html>
-'''

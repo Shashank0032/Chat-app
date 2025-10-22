@@ -1,4 +1,3 @@
-
 <!doctype html>
 <html>
 
@@ -11,10 +10,11 @@
 <body>
     <div class="container">
         <h2>Register for Chat</h2>
-        <form action="/register" method="post">
+        <form action="/register" method="post" id="regForm" novalidate>
             <div class="form-group">
                 <label for="name">Name:</label>
-                <input type="text" id="name" name="name" required>
+                <input autocomplete="off" type="text" id="name" name="name" required>
+                <small id="nameHelp" style="color:#c00; display:none;">This name is already taken.</small>
             </div>
             <div class="form-group">
                 <label for="age">Age:</label>
@@ -30,11 +30,46 @@
             </div>
             <button type="submit">Join Chat</button>
         </form>
+
         {% if request.query_params.error == 'age_restriction' %}
-            <p style="color: red;">You must be 18 or older to join the chat.</p>
+        <p style="color: red; margin-top:8px;">You must be 18 or older to join the chat.</p>
+        {% elif request.query_params.error == 'name_taken' %}
+        <p style="color: red; margin-top:8px;">That name is already registered — pick another.</p>
         {% endif %}
     </div>
+
+    <script>
+        // inline availability check
+        const nameInput = document.getElementById('name');
+        const nameHelp = document.getElementById('nameHelp');
+        let lastQuery = '';
+        let inflight;
+
+        async function checkName(n) {
+            if (!n.trim()) { nameHelp.style.display = 'none'; return; }
+            if (inflight) inflight.abort();
+            inflight = new AbortController();
+            try {
+                const r = await fetch(`/api/name_available?name=${encodeURIComponent(n)}`, { signal: inflight.signal });
+                const j = await r.json();
+                nameHelp.style.display = j.available ? 'none' : 'inline';
+            } catch (_) { }
+        }
+
+        nameInput.addEventListener('input', (e) => {
+            const n = e.target.value;
+            if (n === lastQuery) return;
+            lastQuery = n;
+            checkName(n);
+        });
+
+        // block submit if currently flagged as taken
+        document.getElementById('regForm').addEventListener('submit', (e) => {
+            if (nameHelp.style.display !== 'none') {
+                e.preventDefault();
+            }
+        });
+    </script>
 </body>
 
 </html>
-
